@@ -1,58 +1,141 @@
+# Substitutions — change this block per device
 substitutions:
-  name: svp-warmteset
-  friendly_name: "Stadsverwarming Warmteset"
+  device_name: "your-device-name"
+  device_id: yourdeviceid
+  comment: "Kamstrup Multical 402 IR heat meter reader"
+  friendly_name: "Your Friendly Name"
+  time_timezone: "Europe/Amsterdam"
+  board_type: "ESP32-S3-N16R8"  # Shown in HA Device Info as firmware label
 
+# ESPHome core
 esphome:
-  name: ${name}
-  friendly_name: ${friendly_name}
+  name: "${device_name}"
+  comment: "${comment}"
   project:
-    name: "Jarvis.Stadsverwarming Warmteset"
-    version: "ESP32-S3-N16R8"
+    name: "ESPHome.${friendly_name}"
+    version: "${board_type}"
+  platformio_options:
+    board_build.flash_mode: dio
 
+# Board
+# UICPAL ESP32-S3-N16R8 — 16MB flash, 8MB Octal PSRAM
+# GPIO33 reserved for PSRAM on S3R8 — do not use!
+# GPIO35/36/37 = Octal PSRAM — do not use!
 esp32:
-  board: esp32-s3-devkitc-1
+  variant: esp32s3
+  cpu_frequency: 240MHz
+  flash_size: 16MB
   framework:
     type: esp-idf
 
-# External component — point to your local components folder or a GitHub repo
+psram:
+  mode: octal
+  speed: 80MHz
+
+# Logging
+logger:
+  level: INFO
+
+# WiFi + fallback AP
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  domain: !secret network_domain
+  min_auth_mode: WPA2
+  power_save_mode: none
+  ap:
+    ssid: "${device_name} Fallback"
+    password: !secret std_pass
+
+captive_portal:
+
+# Safe mode — falls back on repeated boot failures, keeps OTA available
+safe_mode:
+
+# Local device UI accessible via IP in browser
+web_server:
+  port: 80
+
+# OTA
+ota:
+  - platform: esphome
+    password: !secret std_pass
+
+# Home Assistant API
+api:
+  encryption:
+    key: !secret encryption_key
+
+# Time
+time:
+  - platform: homeassistant
+    id: time_homeassistant
+    timezone: "${time_timezone}"
+    on_time_sync:
+      - component.update: sensor_uptime_timestamp
+
+# Buttons
+button:
+  - platform: restart
+    id: button_restart
+    name: "Restart"
+    entity_category: config
+
+# Onboard RGB LED (ESP32-S3 DevKitC)
+light:
+  - platform: esp32_rmt_led_strip
+    id: light_rgb
+    name: "RGB LED"
+    pin: GPIO48
+    num_leds: 1
+    chipset: WS2812
+    rgb_order: GRB
+    restore_mode: ALWAYS_OFF
+    entity_category: config
+
+# External component — Multical402 via local components folder
+# Required file structure:
+# /config/esphome/components/multical402/__init__.py
+# /config/esphome/components/multical402/sensor.py
+# /config/esphome/components/multical402/kmp.h
+# /config/esphome/components/multical402/multical402.h
 external_components:
   - source:
       type: local
       path: components
+    components: [ multical402 ]
 
-logger:
-  level: DEBUG
-
-api:
-  encryption:
-    key: !secret api_key
-
-ota:
-  - platform: esphome
-    password: !secret ota_password
-
-wifi:
-  ssid: !secret wifi_ssid
-  password: !secret wifi_password
-  ap:
-    ssid: "${name} Fallback"
-    password: !secret fallback_password
-
-# USB UART — Hichi HB0015 with CP2102 chip connected via USB-OTG
-usb_host:
-  - id: usb_host_bus
-
+# USB UART — Hichi HB0015 with CP2102 chip
+# Connect the HB0015 USB connector to the USB-OTG port of the ESP32-S3
 usb_uart:
   - type: cp210x
-    usb_host_id: usb_host_bus
     channels:
       - id: uart_kamstrup
         baud_rate: 1200
         stop_bits: 2
-        buffer_size: 4096
+        buffer_size: 8192
 
-# Kamstrup Multical402 sensors via custom component
+# P1 port UART
+# GPIO16 = RX (inverted P1 signal from heat delivery unit)
+# GPIO4  = Data Request pin (RTS, HIGH to activate data)
+uart:
+  id: uart_p1
+  rx_pin:
+    number: GPIO16
+    inverted: true
+  baud_rate: 115200
+  rx_buffer_size: 1500
+
+# DSMR component — reads P1 telegrams from heat delivery unit
+dsmr:
+  uart_id: uart_p1
+  request_pin: GPIO4
+  request_interval: 10s
+
+# Sensors
 sensor:
+
+  # Kamstrup Multical402 — IR optical read head (KMP protocol)
   - platform: multical402
     uart_id: uart_kamstrup
     update_interval: 30s
@@ -78,12 +161,62 @@ sensor:
       name: "IR Volume"
       force_update: true
 
+  # P1 DSMR sensors — heat delivery unit
+  - platform: dsmr
+    energy_delivered_lux:
+      name: "P1 Warmte Energie"
+      state_class: total_increasing
+      device_class: energy
+      icon: "mdi:lightning-bolt-outline"
+
+  # Diagnostic sensors
   - platform: wifi_signal
     name: "WiFi Signal"
-    update_interval: 60s
+    id: sensor_wifi_signal
+    update_interval: 300s
+    icon: "mdi:wifi-strength-3"
+    entity_category: diagnostic
 
   - platform: uptime
-    name: sensor_uptime
     id: sensor_uptime
 
-psram:
+  - platform: template
+    id: sensor_uptime_timestamp
+    name: "Uptime"
+    device_class: timestamp
+    accuracy_decimals: 0
+    update_interval: never
+    entity_category: diagnostic
+    lambda: |-
+      static float timestamp = (
+        id(time_homeassistant).utcnow().timestamp - id(sensor_uptime).state
+      );
+      return timestamp;
+
+# Diagnostic text sensors
+text_sensor:
+  - platform: wifi_info
+    ip_address:
+      name: "IP Address"
+      icon: "mdi:network-outline"
+      entity_category: diagnostic
+    ssid:
+      name: "Connected SSID"
+      icon: "mdi:wifi"
+      entity_category: diagnostic
+    bssid:
+      name: "Connected BSSID"
+      icon: "mdi:wifi-alert"
+      entity_category: diagnostic
+
+  - platform: version
+    id: text_sensor_version
+    name: "ESPHome Version"
+    entity_category: diagnostic
+    hide_timestamp: true
+
+# Diagnostic binary sensors
+binary_sensor:
+  - platform: status
+    name: "Status"
+    entity_category: diagnostic
